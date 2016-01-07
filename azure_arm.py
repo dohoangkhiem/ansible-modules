@@ -29,6 +29,11 @@ except ImportError:
     HAS_AZURE = False
 
 
+def check_azure_result(module, result):
+    if result.status_code != 200:
+        module.fail_json(msg='Got error code from Azure, status code = {}'.format(result.status_code))
+
+
 def get_azure_creds(module):
     subscription_id = module.params.get('subscription_id')
     if not subscription_id:
@@ -71,15 +76,17 @@ def get_token_from_client_credentials(endpoint, client_id, client_secret):
 
 
 def create_network_interface(module, network_client):
-
     location = module.params.get('location')
     group_name = module.params.get('resource_group')
     network_name = module.params.get('virtual_network')
     subnet_name = module.params.get('subnet')
     interface_name = module.params.get('name') + '_nic'
     ip_name = module.params.get('name') + '_ip'
+    static_public_ip = module.params.get('static_public_ip')
 
     result = network_client.subnets.get(group_name, network_name, subnet_name)
+    check_azure_result(module, result)
+
     subnet = result.subnet
 
     result = network_client.public_ip_addresses.create_or_update(
@@ -87,12 +94,15 @@ def create_network_interface(module, network_client):
         ip_name,
         azure.mgmt.network.PublicIpAddress(
             location=location,
-            public_ip_allocation_method='Dynamic',
+            public_ip_allocation_method='Static' if static_public_ip else 'Dynamic',
             idle_timeout_in_minutes=4,
         ),
     )
+    check_azure_result(module, result)
 
     result = network_client.public_ip_addresses.get(group_name, ip_name)
+    check_azure_result(module, result)
+
     public_ip = result.public_ip_address
     public_ip_id = public_ip.id
 
@@ -114,11 +124,13 @@ def create_network_interface(module, network_client):
             ],
         ),
     )
+    check_azure_result(module, result)
 
     result = network_client.network_interfaces.get(
         group_name,
         interface_name,
     )
+    check_azure_result(module, result)
 
     return result.network_interface, public_ip
 
@@ -143,26 +155,44 @@ def build_os_profile(admin_username, admin_password, computer_name,
     return os_profile
 
 
-def build_storate_profile(os_disk_name, storage_name, image_publisher, image_offer, image_sku, image_version):
-    storage_profile=azure.mgmt.compute.StorageProfile(
-        os_disk=azure.mgmt.compute.OSDisk(
-            caching=azure.mgmt.compute.CachingTypes.none,
-            create_option=azure.mgmt.compute.DiskCreateOptionTypes.from_image,
-            name=os_disk_name,
-            virtual_hard_disk=azure.mgmt.compute.VirtualHardDisk(
-                uri='https://{0}.blob.core.windows.net/vhds/{1}.vhd'.format(
-                    storage_name,
-                    os_disk_name,
+def build_storate_profile(os_disk_name, storage_name, source_image_uri, os_type, image_publisher, image_offer, image_sku, image_version):
+    if source_image_uri:
+        storage_profile=azure.mgmt.compute.StorageProfile(
+            os_disk=azure.mgmt.compute.OSDisk(
+                operating_system_type=os_type,
+                caching=azure.mgmt.compute.CachingTypes.none,
+                create_option=azure.mgmt.compute.DiskCreateOptionTypes.from_image,
+                name=os_disk_name,
+                virtual_hard_disk=azure.mgmt.compute.VirtualHardDisk(
+                    uri='https://{0}.blob.core.windows.net/vhds/{1}.vhd'.format(
+                        storage_name,
+                        os_disk_name,
+                    ),
+                ),
+                source_image=azure.mgmt.compute.VirtualHardDisk(
+                    uri=source_image_uri,
                 ),
             ),
-        ),
-        image_reference = azure.mgmt.compute.ImageReference(
-            publisher=image_publisher,
-            offer=image_offer,
-            sku=image_sku,
-            version=image_version,
-        ),
-    )
+    else:
+        storage_profile=azure.mgmt.compute.StorageProfile(
+            os_disk=azure.mgmt.compute.OSDisk(
+                caching=azure.mgmt.compute.CachingTypes.none,
+                create_option=azure.mgmt.compute.DiskCreateOptionTypes.from_image,
+                name=os_disk_name,
+                virtual_hard_disk=azure.mgmt.compute.VirtualHardDisk(
+                    uri='https://{0}.blob.core.windows.net/vhds/{1}.vhd'.format(
+                        storage_name,
+                        os_disk_name,
+                    ),
+                ),
+            ),
+            image_reference = azure.mgmt.compute.ImageReference(
+                publisher=image_publisher,
+                offer=image_offer,
+                sku=image_sku,
+                version=image_version,
+            ),
+        )
     return storage_profile
 
 
@@ -170,6 +200,7 @@ def create_virtual_machine(module, compute_client, nic):
     location = module.params.get('location')
     group_name = module.params.get('resource_group')
     vm_name = module.params.get('name')
+    tags = module.params.get('tags')
 
     admin_username = module.params.get('username')
     admin_password = module.params.get('password')
@@ -179,6 +210,9 @@ def create_virtual_machine(module, compute_client, nic):
 
     os_disk_name = vm_name + '_disk'
     storage_account = module.params.get('storage_account')
+
+    source_image_uri = module.params.get('source_image_uri')
+    os_type = module.params.get('os_type')
     image_publisher = module.params.get('image_publisher')
     image_offer = module.params.get('image_offer')
     image_sku = module.params.get('image_sku')
@@ -190,9 +224,9 @@ def create_virtual_machine(module, compute_client, nic):
     os_profile = build_os_profile(admin_username, admin_password, computer_name,
                                   admin_ssh_public_key_file, disable_password_auth)
 
-    storage_profile = build_storate_profile(os_disk_name, storage_account, image_publisher, image_offer, image_sku, image_version)
+    storage_profile = build_storate_profile(os_disk_name, storage_account, source_image_uri, os_type, image_publisher, image_offer, image_sku, image_version)
 
-    network_profile=azure.mgmt.compute.NetworkProfile(
+    network_profile = azure.mgmt.compute.NetworkProfile(
         network_interfaces=[
             azure.mgmt.compute.NetworkInterfaceReference(
                 reference_uri=nic.id,
@@ -211,6 +245,7 @@ def create_virtual_machine(module, compute_client, nic):
             ),
             network_profile=network_profile,
             storage_profile=storage_profile,
+            tags=tags
         ),
     )
 
@@ -218,6 +253,8 @@ def create_virtual_machine(module, compute_client, nic):
         module.fail_json(msg='Failed to create new virtual machine, status code = {}'.format(result.status_code))
 
     result = compute_client.virtual_machines.get(group_name, vm_name)
+    if result.status_code != 200:
+        module.fail_json(msg='Failed to get newly created virtual machine, status code = {}'.format(result.status_code))
 
     return result.virtual_machine
 
@@ -231,14 +268,18 @@ def main():
             computer_name=dict(),
             ssh_public_key_file=dict(),
             disable_password_auth=dict(type='bool', default=True),
+            tags=dict(),
+            static_public_ip=dict(type='bool', default=True),
 
             # vm image
-            image_publisher=dict(required=True),
-            image_offer=dict(required=True),
-            image_sku=dict(required=True),
-            image_version=dict(required=True),
+            source_image_uri=dict(),
+            os_type=dict(default='Linux', required=True, choices=['Linux', 'Windows']),
+            image_publisher=dict(),
+            image_offer=dict(),
+            image_sku=dict(),
+            image_version=dict(),
 
-            state=dict(default='present'),
+            state=dict(default='present', choices=['present', 'absent']),
             wait=dict(type='bool', default=False),
             wait_timeout=dict(default=600),
             wait_timeout_redirects=dict(default=300),
@@ -262,13 +303,25 @@ def main():
     if not HAS_AZURE:
         module.fail_json(msg='azure python module required for this module')
 
+    source_image_uri = module.params.get('source_image_uri')
+    image_publisher = module.params.get('image_publisher')
+    image_offer = module.params.get('image_offer')
+    image_sku = module.params.get('image_sku')
+    image_version = module.params.get('image_version')
+
+    state = module.params.get('state')
+    if state == 'absent':
+        module.fail_json(changed=False, msg='Unsupported state')
+
+    if not source_image_uri:
+        if not image_publisher or not image_offer or not image_sku or not image_version:
+            module.fail_json(changed=False, msg='Either (source_image_uri, os_type) or (image_publisher, image_offer, image_sku, image_version) must be specified')
+
     subscription_id, oauth2_token_endpoint, client_id, client_secret = get_azure_creds(module)
     auth_token = get_token_from_client_credentials(oauth2_token_endpoint, client_id, client_secret)
 
     creds = SubscriptionCloudCredentials(subscription_id, auth_token)
 
-    resource_client = ResourceManagementClient(creds)
-    storage_client = StorageManagementClient(creds)
     compute_client = ComputeManagementClient(creds)
     network_client = NetworkResourceProviderClient(creds)
 
