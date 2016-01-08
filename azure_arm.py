@@ -22,16 +22,18 @@ try:
     from azure.mgmt.network import NetworkResourceProviderClient
     from azure.mgmt.storage import StorageManagementClient
     from azure.mgmt.compute import ComputeManagementClient
-    from azure.mgmt.compute import OSProfile, LinuxConfiguration, SshConfiguration, SshPublicKey
+    from azure.mgmt.compute import OSProfile, LinuxConfiguration, SshConfiguration, SshPublicKey, \
+        OSDisk, VirtualHardDisk, StorageProfile, NetworkProfile, VirtualMachineSizeTypes
 
     HAS_AZURE = True
 except ImportError:
     HAS_AZURE = False
 
 
-def check_azure_result(module, result):
-    if result.status_code != 200:
-        module.fail_json(msg='Got error code from Azure, status code = {}'.format(result.status_code))
+def check_azure_result(module, result, operation=None, info=None):
+    if result.status_code != 200 and result.status_code != 201:
+        module.fail_json(msg='Got Azure error code, status code = {}, operation = {}, {}'
+                         .format(result.status_code, operation, info))
 
 
 def get_azure_creds(module):
@@ -98,10 +100,11 @@ def create_network_interface(module, network_client):
             idle_timeout_in_minutes=4,
         ),
     )
-    check_azure_result(module, result)
+    check_azure_result(module, result, 'create_or_update_public_ip_address',
+                       'ip_name={} is_static={}'.format(ip_name, static_public_ip))
 
     result = network_client.public_ip_addresses.get(group_name, ip_name)
-    check_azure_result(module, result)
+    check_azure_result(module, result, 'get_public_ip_address', 'ip_name=' + ip_name)
 
     public_ip = result.public_ip_address
     public_ip_id = public_ip.id
@@ -124,13 +127,14 @@ def create_network_interface(module, network_client):
             ],
         ),
     )
-    check_azure_result(module, result)
+    check_azure_result(module, result, 'create_or_update_network_interface',
+                       'interface_name={} subnet={} public_ip_id={}'.format(interface_name, subnet, public_ip_id))
 
     result = network_client.network_interfaces.get(
         group_name,
         interface_name,
     )
-    check_azure_result(module, result)
+    check_azure_result(module, result, 'get_network_interface', 'interface_name={}'.format(interface_name))
 
     return result.network_interface, public_ip
 
@@ -173,6 +177,7 @@ def build_storate_profile(os_disk_name, storage_name, source_image_uri, os_type,
                     uri=source_image_uri,
                 ),
             ),
+        )
     else:
         storage_profile=azure.mgmt.compute.StorageProfile(
             os_disk=azure.mgmt.compute.OSDisk(
@@ -201,6 +206,7 @@ def create_virtual_machine(module, compute_client, nic):
     group_name = module.params.get('resource_group')
     vm_name = module.params.get('name')
     tags = module.params.get('tags')
+    vm_size = module.params.get('vm_size')
 
     admin_username = module.params.get('username')
     admin_password = module.params.get('password')
@@ -241,7 +247,7 @@ def create_virtual_machine(module, compute_client, nic):
             name=vm_name,
             os_profile=os_profile,
             hardware_profile=azure.mgmt.compute.HardwareProfile(
-                virtual_machine_size=azure.mgmt.compute.VirtualMachineSizeTypes.standard_a0
+                virtual_machine_size=vm_size
             ),
             network_profile=network_profile,
             storage_profile=storage_profile,
@@ -249,12 +255,10 @@ def create_virtual_machine(module, compute_client, nic):
         ),
     )
 
-    if result.status_code != 200:
-        module.fail_json(msg='Failed to create new virtual machine, status code = {}'.format(result.status_code))
+    check_azure_result(module, result, 'create_or_update_virtual_machine', 'vm_name={}'.format(vm_name))
 
     result = compute_client.virtual_machines.get(group_name, vm_name)
-    if result.status_code != 200:
-        module.fail_json(msg='Failed to get newly created virtual machine, status code = {}'.format(result.status_code))
+    check_azure_result(module, result, 'get_virtual_machine', 'vm_name={}'.format(vm_name))
 
     return result.virtual_machine
 
@@ -270,10 +274,31 @@ def main():
             disable_password_auth=dict(type='bool', default=True),
             tags=dict(),
             static_public_ip=dict(type='bool', default=True),
+            vm_size=dict(default='Standard_A2', choices=[VirtualMachineSizeTypes.basic_a0,
+                                                         VirtualMachineSizeTypes.basic_a1,
+                                                         VirtualMachineSizeTypes.basic_a2,
+                                                         VirtualMachineSizeTypes.basic_a3,
+                                                         VirtualMachineSizeTypes.basic_a4,
+                                                         VirtualMachineSizeTypes.standard_a0,
+                                                         VirtualMachineSizeTypes.standard_a1,
+                                                         VirtualMachineSizeTypes.standard_a2,
+                                                         VirtualMachineSizeTypes.standard_a3,
+                                                         VirtualMachineSizeTypes.standard_a4,
+                                                         VirtualMachineSizeTypes.standard_a5,
+                                                         VirtualMachineSizeTypes.standard_a6,
+                                                         VirtualMachineSizeTypes.standard_a7,
+                                                         VirtualMachineSizeTypes.standard_a8,
+                                                         VirtualMachineSizeTypes.standard_a9,
+                                                         VirtualMachineSizeTypes.standard_g1,
+                                                         VirtualMachineSizeTypes.standard_g2,
+                                                         VirtualMachineSizeTypes.standard_g3,
+                                                         VirtualMachineSizeTypes.standard_g4,
+                                                         VirtualMachineSizeTypes.standard_g5,
+                                                         ]),
 
             # vm image
             source_image_uri=dict(),
-            os_type=dict(default='Linux', required=True, choices=['Linux', 'Windows']),
+            os_type=dict(default='Linux', choices=['Linux', 'Windows']),
             image_publisher=dict(),
             image_offer=dict(),
             image_sku=dict(),
