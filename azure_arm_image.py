@@ -102,7 +102,7 @@ def capture_vm_image(module, compute_client):
     check_azure_result(module, result, 'capture_vm_image', 'vm_name={}'.format(vm_name))
 
     try:
-        os_disk = json.loads(result.output)['resources'][0]['properties']['storage_profile']['osDisk']
+        os_disk = json.loads(result.output)['resources'][0]['properties']['storageProfile']['osDisk']
         image_name = os_disk['name']
         image_uri = os_disk['image']['uri']
         module.exit_json(changed=True, vm_name=vm_name, image_name=image_name, image_uri=image_uri)

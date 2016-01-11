@@ -263,11 +263,71 @@ def create_virtual_machine(module, compute_client, nic):
     return result.virtual_machine
 
 
+def delete_network_interface(module, network_client, group_name, network_interface_name,
+                             delete_public_ip_addresses=True):
+    nic = None
+    try:
+        nic = network_client.network_interfaces.get(group_name, network_interface_name).network_interface
+    except AzureMissingException, e:
+        return
+
+    if not nic:
+        return
+
+    result = network_client.network_interfaces.delete(group_name, network_interface_name)
+    check_azure_result(module, result, 'delete_network_interface', 'network_interface_name={}'
+                                       .format(network_interface_name))
+
+    if delete_public_ip_addresses:
+        for ip_config in nic.ip_configurations:
+            if hasattr(ip_config, 'public_ip_address'):
+                ip_name = ip_config.public_ip_address.id.split('/')[-1]
+                delete_public_ip(module, group_name, ip_name)
+
+
+def delete_public_ip(module, network_client, group_name, public_ip_name):
+    # try deleting public ip and network interface
+    try:
+        network_client.public_ip_addresses.get(group_name, public_ip_name)
+        result = network_client.public_ip_addresses.delete(group_name, public_ip_name)
+        check_azure_result(module, result, 'delete_public_ip_address', 'public_ip_name={}'.format(public_ip_name))
+    except AzureMissingException, e:
+        pass
+
+
+def delete_virtual_machine(module, compute_client, network_client,
+                           delete_network_interfaces=True, delete_public_ip_addresses=True,
+                           delete_vhd=True):
+    group_name = module.params.get('resource_group')
+    vm_name = module.params.get('name')
+
+    # check if vm exists
+    vm = None
+    try:
+        vm = compute_client.virtual_machines.get(group_name, vm_name).virtual_machine
+    except AzureMissingException:
+        module.exit_json(changed=False)
+
+    if not vm:
+        module.exit_json(changed=False)
+
+    result = compute_client.virtual_machines.delete(group_name, vm_name)
+    check_azure_result(module, result, 'delete_virtual_machine', 'vm_name={}'.format(vm_name))
+
+    if delete_network_interfaces:
+        if vm.network_profile.network_interfaces:
+            for nwi in vm.network_profile.network_interfaces:
+                nic_name = nwi.reference_uri.split('/')[-1]
+                delete_network_interface(module, network_client, group_name, nic_name, delete_public_ip_addresses)
+
+    module.exit_json(changed=True, vm_name=vm_name)
+
+
 def main():
     module = AnsibleModule(
         argument_spec=dict(
             name=dict(required=True),
-            username=dict(required=True),
+            username=dict(),
             password=dict(),
             computer_name=dict(),
             ssh_public_key_file=dict(),
@@ -314,7 +374,7 @@ def main():
             virtual_network=dict(),
             subnet=dict(),
             security_group=dict(),
-            storage_account=dict(required=True),
+            storage_account=dict(),
             location=dict(default='eastus'),
 
             # for credentials
@@ -328,6 +388,9 @@ def main():
     if not HAS_AZURE:
         module.fail_json(msg='azure python module required for this module')
 
+    username = module.params.get('username')
+    storage_account = module.params.get('storage_account')
+
     source_image_uri = module.params.get('source_image_uri')
     image_publisher = module.params.get('image_publisher')
     image_offer = module.params.get('image_offer')
@@ -335,12 +398,17 @@ def main():
     image_version = module.params.get('image_version')
 
     state = module.params.get('state')
-    if state == 'absent':
-        module.fail_json(changed=False, msg='Unsupported state')
 
-    if not source_image_uri:
-        if not image_publisher or not image_offer or not image_sku or not image_version:
-            module.fail_json(changed=False, msg='Either (source_image_uri, os_type) or (image_publisher, image_offer, image_sku, image_version) must be specified')
+    if state == 'present':
+        if not username:
+            module.fail_json(msg='username must be specified')
+
+        if not storage_account:
+            module.fail_json(msg='storage_account must be specified')
+
+        if not source_image_uri:
+            if not image_publisher or not image_offer or not image_sku or not image_version:
+                module.fail_json(changed=False, msg='Either (source_image_uri, os_type) or (image_publisher, image_offer, image_sku, image_version) must be specified')
 
     subscription_id, oauth2_token_endpoint, client_id, client_secret = get_azure_creds(module)
     auth_token = get_token_from_client_credentials(oauth2_token_endpoint, client_id, client_secret)
@@ -349,14 +417,19 @@ def main():
 
     compute_client = ComputeManagementClient(creds)
     network_client = NetworkResourceProviderClient(creds)
+    storage_client = azure.mgmt.storage.StorageManagementClient(creds)
 
-    nic, public_ip = create_network_interface(module, network_client)
-    vm = create_virtual_machine(module, compute_client, nic)
-    public_ip = network_client.public_ip_addresses\
-        .get(module.params.get('resource_group'), public_ip.name).public_ip_address
+    if state == 'absent':
+        delete_virtual_machine(module, compute_client, network_client)
 
-    module.exit_json(changed=True, vm_name=vm.name, network_interface=nic.name, public_ip_name=public_ip.name,
-                     public_ip_address=public_ip.ip_address)
+    elif state == 'present':
+        nic, public_ip = create_network_interface(module, network_client)
+        vm = create_virtual_machine(module, compute_client, nic)
+        public_ip = network_client.public_ip_addresses\
+            .get(module.params.get('resource_group'), public_ip.name).public_ip_address
+
+        module.exit_json(changed=True, vm_name=vm.name, network_interface=nic.name, public_ip_name=public_ip.name,
+                         public_ip_address=public_ip.ip_address)
 
 # import module snippets
 from ansible.module_utils.basic import *
