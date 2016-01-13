@@ -25,6 +25,8 @@ try:
     from azure.mgmt.compute import OSProfile, LinuxConfiguration, SshConfiguration, SshPublicKey, \
         OSDisk, VirtualHardDisk, StorageProfile, NetworkProfile, VirtualMachineSizeTypes
 
+    from azure.storage.blob.blobservice import BlobService
+
     HAS_AZURE = True
 except ImportError:
     HAS_AZURE = False
@@ -282,7 +284,7 @@ def delete_network_interface(module, network_client, group_name, network_interfa
         for ip_config in nic.ip_configurations:
             if hasattr(ip_config, 'public_ip_address'):
                 ip_name = ip_config.public_ip_address.id.split('/')[-1]
-                delete_public_ip(module, group_name, ip_name)
+                delete_public_ip(module, network_client, group_name, ip_name)
 
 
 def delete_public_ip(module, network_client, group_name, public_ip_name):
@@ -295,11 +297,22 @@ def delete_public_ip(module, network_client, group_name, public_ip_name):
         pass
 
 
-def delete_virtual_machine(module, compute_client, network_client,
-                           delete_network_interfaces=True, delete_public_ip_addresses=True,
-                           delete_vhd=True):
+def delete_blob(module, storage_client, group_name, storage_account, container_name, blob_name):
+    try:
+        access_key = storage_client.storage_accounts.list_keys(group_name, storage_account).storage_account_keys.key1
+        blob_service = BlobService(storage_account, access_key)
+        blob_service.delete_blob(container_name, blob_name)
+    except AzureException, e:
+        module.fail_json(msg='Failed to delete Blob {}/{} in storage account {}. Error: {}'
+                         .format(container_name, blob_name, storage_account, e))
+
+
+def delete_virtual_machine(module, compute_client, network_client, storage_client):
     group_name = module.params.get('resource_group')
     vm_name = module.params.get('name')
+    delete_network_interfaces = module.params.get('delete_network_interfaces')
+    delete_public_ip_addresses = module.params.get('delete_public_ip_addresses')
+    delete_vhd = module.params.get('delete_os_disk_vhd')
 
     # check if vm exists
     vm = None
@@ -319,6 +332,16 @@ def delete_virtual_machine(module, compute_client, network_client,
             for nwi in vm.network_profile.network_interfaces:
                 nic_name = nwi.reference_uri.split('/')[-1]
                 delete_network_interface(module, network_client, group_name, nic_name, delete_public_ip_addresses)
+
+    if delete_vhd:
+        if vm.storage_profile.os_disk:
+            uri = vm.storage_profile.os_disk.virtual_hard_disk.uri
+            m = re.match(r'^https://(.+)\.blob\.core\.windows\.net/(.+)/(.+)$', uri)
+            if m:
+                storage_account = m.group(1)
+                container = m.group(2)
+                blob_name = m.group(3)
+                delete_blob(module, storage_client, group_name, storage_account, container, blob_name)
 
     module.exit_json(changed=True, vm_name=vm_name)
 
@@ -368,6 +391,11 @@ def main():
             wait=dict(type='bool', default=False),
             wait_timeout=dict(default=600),
             wait_timeout_redirects=dict(default=300),
+
+            # for deleting
+            delete_network_interfaces=dict(type='bool', default=True),
+            delete_public_ip_addresses=dict(type='bool', default=True),
+            delete_os_disk_vhd=dict(type='bool', default=True),
 
             # prerequisite resources
             resource_group=dict(required=True),
@@ -420,7 +448,7 @@ def main():
     storage_client = azure.mgmt.storage.StorageManagementClient(creds)
 
     if state == 'absent':
-        delete_virtual_machine(module, compute_client, network_client)
+        delete_virtual_machine(module, compute_client, network_client, storage_client)
 
     elif state == 'present':
         nic, public_ip = create_network_interface(module, network_client)
